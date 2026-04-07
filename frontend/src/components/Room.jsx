@@ -8,6 +8,12 @@ const PREFERRED_MIME = (() => {
   return types.find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
 })();
 
+// Detect mobile device
+const isMobile = /Android|iPhone|iPad|iPod|Opera Mini|IEMobile|WPDesktop/i.test(navigator.userAgent);
+
+// Check if screen sharing is natively supported
+const canDisplayMedia = !!(navigator.mediaDevices?.getDisplayMedia);
+
 const Room = ({ session, onLeave }) => {
   const [roomId, setRoomId] = useState(session.roomId || '');
   const [status, setStatus] = useState('Connecting...');
@@ -18,6 +24,8 @@ const Room = ({ session, onLeave }) => {
   const [isSharing, setIsSharing] = useState(false);
   const [hasStream, setHasStream] = useState(false);
   const [playBlocked, setPlayBlocked] = useState(false);
+  const [shareMode, setShareMode] = useState(null); // 'screen' | 'camera' | null
+  const [showMobileMenu, setShowMobileMenu] = useState(false);
 
   const videoRef = useRef(null);
   const chatEndRef = useRef(null);
@@ -183,11 +191,11 @@ const Room = ({ session, onLeave }) => {
   };
 
   const startScreenShare = async () => {
+    setShowMobileMenu(false);
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
       localStream.current = stream;
 
-      // Host preview (muted)
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         videoRef.current.muted = true;
@@ -196,12 +204,45 @@ const Room = ({ session, onLeave }) => {
 
       isSharingRef.current = true;
       setIsSharing(true);
+      setShareMode('screen');
       startRecording();
 
       stream.getVideoTracks()[0].onended = () => stopScreenShare();
     } catch (e) {
       if (e.name !== 'NotAllowedError') {
         console.error('[HOST] Error starting screen share:', e);
+        // If screen share fails on mobile, notify user
+        if (isMobile) {
+          alert('Screen sharing tidak didukung di browser ini. Coba pakai kamera.');
+        }
+      }
+    }
+  };
+
+  const startCameraShare = async () => {
+    setShowMobileMenu(false);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' }, // rear camera default
+        audio: true,
+      });
+      localStream.current = stream;
+
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        videoRef.current.muted = true;
+        videoRef.current.play().catch(() => {});
+      }
+
+      isSharingRef.current = true;
+      setIsSharing(true);
+      setShareMode('camera');
+      startRecording();
+
+      stream.getVideoTracks()[0].onended = () => stopScreenShare();
+    } catch (e) {
+      if (e.name !== 'NotAllowedError') {
+        console.error('[HOST] Error starting camera share:', e);
       }
     }
   };
@@ -214,6 +255,8 @@ const Room = ({ session, onLeave }) => {
     }
     isSharingRef.current = false;
     setIsSharing(false);
+    setShareMode(null);
+    setShowMobileMenu(false);
     socket.emit('screen-share-stopped', { roomId });
     if (videoRef.current) {
       videoRef.current.srcObject = null;
@@ -401,13 +444,58 @@ const Room = ({ session, onLeave }) => {
             {session.isHost ? (
               <div className="room-header-controls">
                 {!isSharing ? (
-                  <button className="btn btn-primary" onClick={startScreenShare} style={{ width: 'auto' }}>
-                    Start Sharing Screen
-                  </button>
+                  isMobile ? (
+                    // Mobile: show dropdown menu to pick screen or camera
+                    <div style={{ position: 'relative' }}>
+                      <button
+                        className="btn btn-primary"
+                        onClick={() => setShowMobileMenu(prev => !prev)}
+                        style={{ width: 'auto' }}
+                      >
+                        📡 Start Sharing ▾
+                      </button>
+                      {showMobileMenu && (
+                        <div style={{
+                          position: 'absolute',
+                          top: '110%',
+                          left: 0,
+                          background: 'var(--surface-color)',
+                          border: '1px solid var(--border-color)',
+                          borderRadius: 'var(--radius-md)',
+                          zIndex: 100,
+                          minWidth: '180px',
+                          boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
+                          overflow: 'hidden',
+                        }}>
+                          {canDisplayMedia && (
+                            <button
+                              className="btn"
+                              onClick={startScreenShare}
+                              style={{ width: '100%', padding: '0.75rem 1rem', textAlign: 'left', borderRadius: 0, background: 'transparent', border: 'none', cursor: 'pointer' }}
+                            >
+                              🖥️ Share Screen
+                            </button>
+                          )}
+                          <button
+                            className="btn"
+                            onClick={startCameraShare}
+                            style={{ width: '100%', padding: '0.75rem 1rem', textAlign: 'left', borderRadius: 0, background: 'transparent', border: 'none', cursor: 'pointer', borderTop: canDisplayMedia ? '1px solid var(--border-color)' : 'none' }}
+                          >
+                            📷 Share Camera
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    // Desktop: direct screen share
+                    <button className="btn btn-primary" onClick={startScreenShare} style={{ width: 'auto' }}>
+                      🖥️ Start Sharing Screen
+                    </button>
+                  )
                 ) : (
                   <button className="btn btn-primary" onClick={stopScreenShare}
                     style={{ width: 'auto', backgroundColor: 'var(--danger-color)' }}>
-                    Stop Sharing
+                    ⏹ Stop {shareMode === 'camera' ? 'Camera' : 'Screen'}
                   </button>
                 )}
                 <button className="btn btn-secondary" onClick={handleCopyLink} style={{ width: 'auto' }}>
