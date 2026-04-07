@@ -1,26 +1,12 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { socket } from '../socket';
 
-const ICE_SERVERS = {
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+
+const DEFAULT_ICE = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
-    // Free TURN relay servers - fallback when direct P2P connection fails
-    {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-      username: 'openrelayproject',
-      credential: 'openrelayproject',
-    },
   ]
 };
 
@@ -42,6 +28,20 @@ const Room = ({ session, onLeave }) => {
   const localStream = useRef(null);
   const peerConnections = useRef({});
   const pendingCandidates = useRef({});
+  const iceConfig = useRef(DEFAULT_ICE);
+
+  // Fetch ICE config from backend on mount
+  useEffect(() => {
+    fetch(`${BACKEND_URL}/api/ice-servers`)
+      .then(r => r.json())
+      .then(data => {
+        console.log('[ICE Config] Loaded from backend:', data.iceServers);
+        iceConfig.current = { iceServers: data.iceServers };
+      })
+      .catch(() => {
+        console.warn('[ICE Config] Could not fetch from backend, using defaults.');
+      });
+  }, []);
 
   // Auto-scroll chat
   useEffect(() => {
@@ -241,12 +241,27 @@ const Room = ({ session, onLeave }) => {
   }, [session]);
 
   const createPeerConnection = (targetSocketId) => {
-    const pc = new RTCPeerConnection(ICE_SERVERS);
+    const pc = new RTCPeerConnection(iceConfig.current);
     peerConnections.current[targetSocketId] = pc;
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        console.log(`[ICE] Candidate type=${event.candidate.type} proto=${event.candidate.protocol} addr=${event.candidate.address}`);
         socket.emit('webrtc-ice-candidate', { targetSocketId, candidate: event.candidate });
+      } else {
+        console.log(`[ICE] Gathering complete for ${targetSocketId}`);
+      }
+    };
+
+    pc.onicegatheringstatechange = () => {
+      console.log(`[PC ${targetSocketId}] ICE gathering: ${pc.iceGatheringState}`);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[PC ${targetSocketId}] ICE connection: ${pc.iceConnectionState}`);
+      if (pc.iceConnectionState === 'failed') {
+        console.log(`[ICE] Failed — triggering restartIce()...`);
+        pc.restartIce();
       }
     };
 
