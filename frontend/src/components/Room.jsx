@@ -1,7 +1,12 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { socket } from '../socket';
 
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+const BACKEND_URL = (() => {
+  const raw = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+  // Ensure it always has a protocol — Vercel strips https:// from env vars sometimes
+  if (raw.startsWith('http')) return raw;
+  return `https://${raw}`;
+})();
 
 const DEFAULT_ICE = {
   iceServers: [
