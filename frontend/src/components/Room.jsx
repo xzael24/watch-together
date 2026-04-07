@@ -1,12 +1,17 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { socket } from '../socket';
 
-// Best supported MIME type for cross-browser recording + MSE playback
-const PREFERRED_MIME = (() => {
-  if (typeof MediaRecorder === 'undefined') return 'video/webm';
-  const types = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
-  return types.find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+const BACKEND_URL = (() => {
+  const raw = import.meta.env.VITE_BACKEND_URL || 'http://localhost:3001';
+  return raw.startsWith('http') ? raw : `https://${raw}`;
 })();
+
+const DEFAULT_ICE = {
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ]
+};
 
 // Detect mobile device
 const isMobile = /Android|iPhone|iPad|iPod|Opera Mini|IEMobile|WPDesktop/i.test(navigator.userAgent);
@@ -29,192 +34,145 @@ const Room = ({ session, onLeave }) => {
 
   const videoRef = useRef(null);
   const chatEndRef = useRef(null);
-
-  // Host: screen capture + MediaRecorder
   const localStream = useRef(null);
-  const mediaRecorderRef = useRef(null);
-  const isSharingRef = useRef(false); // ref for closure access
-
-  // Viewer: MSE playback
-  const mediaSourceRef = useRef(null);
-  const sourceBufferRef = useRef(null);
-  const chunkQueueRef = useRef([]);
-  const mimeTypeRef = useRef(PREFERRED_MIME);
-
-  // Keep handler refs updated so stale closures inside useEffect always call latest version
-  const onViewerJoinedRef = useRef(null);
-  const onScreenChunkRef = useRef(null);
+  const peerConnections = useRef({});
+  const pendingCandidates = useRef({});
+  const iceConfig = useRef(DEFAULT_ICE);
 
   // Auto-scroll chat
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
-  // Keep these refs current every render  
-  onViewerJoinedRef.current = ({ socketId, nickname }) => {
-    console.log('[HOST] Viewer joined:', nickname);
-    // If currently sharing, restart recording so new viewer gets fresh init segment
-    if (isSharingRef.current) {
-      stopRecording();
-      setTimeout(() => startRecording(), 150);
-    }
-  };
-
-  onScreenChunkRef.current = (chunk) => {
-    if (!session.isHost) {
-      appendChunk(chunk);
-    }
-  };
-
-  // ====================================================
-  // VIEWER: MediaSource API for playback
-  // ====================================================
-  const initViewerStream = (mimeType) => {
-    console.log('[VIEWER] Initializing MediaSource with MIME:', mimeType);
-    mimeTypeRef.current = mimeType;
-    sourceBufferRef.current = null;
-    chunkQueueRef.current = [];
-
-    // Clean up old MediaSource
-    if (mediaSourceRef.current?.readyState === 'open') {
-      try { mediaSourceRef.current.endOfStream(); } catch (e) {}
-    }
-
-    const ms = new MediaSource();
-    mediaSourceRef.current = ms;
-
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-      videoRef.current.src = URL.createObjectURL(ms);
-    }
-
-    ms.addEventListener('sourceopen', () => {
-      try {
-        const sb = ms.addSourceBuffer(mimeType);
-        sb.mode = 'sequence'; // required for live streaming
-        sourceBufferRef.current = sb;
-
-        sb.addEventListener('updateend', () => drainQueue());
-
-        // Drain any chunks that arrived before sourceopen
-        drainQueue();
-      } catch (e) {
-        console.error('[VIEWER] sourceopen error:', e);
-      }
-    }, { once: true });
-
-    // Attempt play
-    setTimeout(() => {
-      const p = videoRef.current?.play();
-      p?.catch(e => {
-        if (e.name === 'NotAllowedError') setPlayBlocked(true);
+  // Fetch ICE servers (TURN credentials) from backend
+  useEffect(() => {
+    fetch(`${BACKEND_URL}/api/ice-servers`)
+      .then(r => r.json())
+      .then(data => {
+        console.log('[ICE] Config loaded:', data.iceServers.map(s => s.urls));
+        iceConfig.current = { iceServers: data.iceServers };
+      })
+      .catch(() => {
+        console.warn('[ICE] Could not fetch config, using defaults.');
       });
-    }, 200);
+  }, []);
 
-    setHasStream(true);
-  };
-
-  const drainQueue = () => {
-    const sb = sourceBufferRef.current;
-    if (!sb || sb.updating || chunkQueueRef.current.length === 0) return;
-
-    // Trim old data to prevent memory bloat (keep last 15s)
-    try {
-      if (sb.buffered.length > 0) {
-        const start = sb.buffered.start(0);
-        const end = sb.buffered.end(sb.buffered.length - 1);
-        if (end - start > 20) {
-          sb.remove(start, end - 15);
-          return; // wait for updateend to drain next
-        }
-      }
-    } catch (e) {}
-
-    const chunk = chunkQueueRef.current.shift();
-    try {
-      sb.appendBuffer(chunk);
-    } catch (e) {
-      if (e.name === 'QuotaExceededError') {
-        console.warn('[VIEWER] Buffer full, clearing queue');
-        chunkQueueRef.current = [];
-      }
+  // ======================================================
+  // WEBRTC HELPERS
+  // ======================================================
+  const createPeerConnection = (targetSocketId) => {
+    // Close any existing connection
+    if (peerConnections.current[targetSocketId]) {
+      peerConnections.current[targetSocketId].close();
     }
-  };
+    pendingCandidates.current[targetSocketId] = [];
 
-  const appendChunk = (chunk) => {
-    const sb = sourceBufferRef.current;
-    if (!sb) {
-      chunkQueueRef.current.push(chunk);
-      return;
-    }
-    if (sb.updating) {
-      chunkQueueRef.current.push(chunk);
-    } else {
-      try {
-        drainQueue();
-        if (!sb.updating) sb.appendBuffer(chunk);
-      } catch (e) {}
-    }
-  };
+    const pc = new RTCPeerConnection(iceConfig.current);
+    peerConnections.current[targetSocketId] = pc;
 
-  // ====================================================
-  // HOST: MediaRecorder → Socket.IO chunks
-  // ====================================================
-  const startRecording = () => {
-    if (!localStream.current) return;
-
-    const recorder = new MediaRecorder(localStream.current, {
-      mimeType: PREFERRED_MIME,
-      videoBitsPerSecond: 1_500_000, // 1.5 Mbps
-    });
-
-    recorder.ondataavailable = async (e) => {
-      if (e.data && e.data.size > 0) {
-        const chunk = await e.data.arrayBuffer();
-        socket.emit('screen-chunk', { roomId: roomId, chunk });
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        console.log(`[ICE] Sending candidate type=${event.candidate.type}`);
+        socket.emit('webrtc-ice-candidate', { targetSocketId, candidate: event.candidate });
       }
     };
 
-    // Notify viewers to (re)initialize their MSE
-    socket.emit('screen-share-started', { roomId: roomId, mimeType: PREFERRED_MIME });
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[PC ${targetSocketId.slice(-4)}] ICE: ${pc.iceConnectionState}`);
+    };
 
-    recorder.start(200); // 200ms chunks
-    mediaRecorderRef.current = recorder;
-    console.log('[HOST] MediaRecorder started');
+    pc.onconnectionstatechange = () => {
+      console.log(`[PC ${targetSocketId.slice(-4)}] Connection: ${pc.connectionState}`);
+    };
+
+    // VIEWER: receive the stream here
+    pc.ontrack = (event) => {
+      console.log('[VIEWER] ontrack fired, streams:', event.streams.length);
+      if (videoRef.current && event.streams[0]) {
+        videoRef.current.srcObject = event.streams[0];
+        setHasStream(true);
+        setPlayBlocked(false);
+
+        const playPromise = videoRef.current.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(e => {
+            if (e.name === 'NotAllowedError') setPlayBlocked(true);
+          });
+        }
+
+        const track = event.streams[0].getVideoTracks()[0];
+        if (track) {
+          track.onended = () => setHasStream(false);
+        }
+      }
+    };
+
+    // HOST: add tracks if stream exists
+    if (session.isHost && localStream.current) {
+      localStream.current.getTracks().forEach(track => {
+        pc.addTrack(track, localStream.current);
+      });
+    }
+
+    return pc;
   };
 
-  const stopRecording = () => {
-    if (mediaRecorderRef.current) {
-      try { mediaRecorderRef.current.stop(); } catch (e) {}
-      mediaRecorderRef.current = null;
+  const drainPendingCandidates = async (socketId, pc) => {
+    const pending = pendingCandidates.current[socketId] || [];
+    if (pending.length > 0) {
+      console.log(`[ICE] Draining ${pending.length} buffered candidates for ${socketId.slice(-4)}`);
     }
+    for (const c of pending) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
+    }
+    pendingCandidates.current[socketId] = [];
+  };
+
+  const negotiateConnection = async (targetSocketId) => {
+    const pc = peerConnections.current[targetSocketId];
+    if (!pc) return;
+    console.log('[HOST] Creating offer for:', targetSocketId.slice(-4));
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit('webrtc-offer', { targetSocketId, offer });
+  };
+
+  // ======================================================
+  // SCREEN / CAMERA SHARE
+  // ======================================================
+  const applyStream = (stream, mode) => {
+    localStream.current = stream;
+
+    if (videoRef.current) {
+      videoRef.current.srcObject = stream;
+      videoRef.current.muted = true;
+      videoRef.current.play().catch(() => {});
+    }
+
+    setIsSharing(true);
+    setShareMode(mode);
+    setShowMobileMenu(false);
+
+    // Renegotiate with all connected viewers
+    Object.entries(peerConnections.current).forEach(async ([socketId, pc]) => {
+      stream.getTracks().forEach(track => {
+        try { pc.addTrack(track, stream); } catch (e) {}
+      });
+      await negotiateConnection(socketId);
+    });
+
+    stream.getVideoTracks()[0].onended = () => stopScreenShare();
   };
 
   const startScreenShare = async () => {
     setShowMobileMenu(false);
     try {
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
-      localStream.current = stream;
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.muted = true;
-        videoRef.current.play().catch(() => {});
-      }
-
-      isSharingRef.current = true;
-      setIsSharing(true);
-      setShareMode('screen');
-      startRecording();
-
-      stream.getVideoTracks()[0].onended = () => stopScreenShare();
+      applyStream(stream, 'screen');
     } catch (e) {
       if (e.name !== 'NotAllowedError') {
-        console.error('[HOST] Error starting screen share:', e);
-        // If screen share fails on mobile, notify user
-        if (isMobile) {
-          alert('Screen sharing tidak didukung di browser ini. Coba pakai kamera.');
-        }
+        console.error('[HOST] Screen share error:', e);
+        if (isMobile) alert('Screen sharing tidak didukung di browser ini. Coba pakai kamera.');
       }
     }
   };
@@ -223,50 +181,33 @@ const Room = ({ session, onLeave }) => {
     setShowMobileMenu(false);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'environment' }, // rear camera default
+        video: { facingMode: 'environment' },
         audio: true,
       });
-      localStream.current = stream;
-
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.muted = true;
-        videoRef.current.play().catch(() => {});
-      }
-
-      isSharingRef.current = true;
-      setIsSharing(true);
-      setShareMode('camera');
-      startRecording();
-
-      stream.getVideoTracks()[0].onended = () => stopScreenShare();
+      applyStream(stream, 'camera');
     } catch (e) {
       if (e.name !== 'NotAllowedError') {
-        console.error('[HOST] Error starting camera share:', e);
+        console.error('[HOST] Camera share error:', e);
       }
     }
   };
 
   const stopScreenShare = () => {
-    stopRecording();
     if (localStream.current) {
       localStream.current.getTracks().forEach(t => t.stop());
       localStream.current = null;
     }
-    isSharingRef.current = false;
     setIsSharing(false);
     setShareMode(null);
     setShowMobileMenu(false);
-    socket.emit('screen-share-stopped', { roomId });
     if (videoRef.current) {
       videoRef.current.srcObject = null;
-      videoRef.current.src = '';
     }
   };
 
-  // ====================================================
-  // SOCKET CONNECTION + EVENT LISTENERS
-  // ====================================================
+  // ======================================================
+  // SOCKET EVENTS
+  // ======================================================
   useEffect(() => {
     socket.connect();
 
@@ -293,13 +234,9 @@ const Room = ({ session, onLeave }) => {
         nickname: session.nickname,
         userId: session.userId,
       }, (res) => {
-        if (res.error) {
-          setStatus('Error: ' + res.error);
-        } else if (res.status === 'approved') {
-          setStatus('In Room');
-        } else {
-          setStatus('Waiting Approval...');
-        }
+        if (res.error) setStatus('Error: ' + res.error);
+        else if (res.status === 'approved') setStatus('In Room');
+        else setStatus('Waiting Approval...');
       });
     }
 
@@ -324,25 +261,70 @@ const Room = ({ session, onLeave }) => {
       socket.disconnect();
     };
 
-    const onViewerJoined = (...args) => onViewerJoinedRef.current?.(...args);
-
-    const onScreenShareStarted = ({ mimeType }) => {
-      if (!session.isHost) {
-        console.log('[VIEWER] Screen share started, MIME:', mimeType);
-        initViewerStream(mimeType);
+    // HOST: viewer joined → create PC and negotiate if streaming
+    const onViewerJoined = async ({ socketId, nickname }) => {
+      console.log('[HOST] Viewer joined:', nickname, socketId.slice(-4));
+      const pc = createPeerConnection(socketId);
+      if (localStream.current) {
+        localStream.current.getTracks().forEach(track => {
+          try { pc.addTrack(track, localStream.current); } catch (e) {}
+        });
+        await negotiateConnection(socketId);
       }
     };
 
-    const onScreenChunk = (chunk) => onScreenChunkRef.current?.(chunk);
+    const onViewerLeft = ({ socketId }) => {
+      if (peerConnections.current[socketId]) {
+        peerConnections.current[socketId].close();
+        delete peerConnections.current[socketId];
+        delete pendingCandidates.current[socketId];
+      }
+    };
 
-    const onScreenShareStopped = () => {
-      if (!session.isHost) {
-        console.log('[VIEWER] Screen share stopped');
-        setHasStream(false);
-        if (videoRef.current) {
-          videoRef.current.src = '';
-          videoRef.current.srcObject = null;
+    // VIEWER: receives offer from host
+    const onWebrtcOffer = async ({ socketId, offer }) => {
+      console.log('[VIEWER] Received offer from', socketId.slice(-4));
+      try {
+        const pc = createPeerConnection(socketId);
+        await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        await drainPendingCandidates(socketId, pc);
+
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('webrtc-answer', { targetSocketId: socketId, answer });
+        console.log('[VIEWER] Answer sent');
+      } catch (e) {
+        console.error('[VIEWER] Offer handling error:', e);
+      }
+    };
+
+    // HOST: receives answer from viewer
+    const onWebrtcAnswer = async ({ socketId, answer }) => {
+      console.log('[HOST] Received answer from', socketId.slice(-4));
+      try {
+        const pc = peerConnections.current[socketId];
+        if (!pc) return console.warn('[HOST] No PC found for', socketId.slice(-4));
+        if (pc.signalingState === 'have-local-offer') {
+          await pc.setRemoteDescription(new RTCSessionDescription(answer));
+          await drainPendingCandidates(socketId, pc);
+          console.log('[HOST] Remote description set successfully');
         }
+      } catch (e) {
+        console.error('[HOST] Answer handling error:', e);
+      }
+    };
+
+    const onWebrtcIceCandidate = async ({ socketId, candidate }) => {
+      const pc = peerConnections.current[socketId];
+      if (!pc || !pc.remoteDescription) {
+        if (!pendingCandidates.current[socketId]) pendingCandidates.current[socketId] = [];
+        pendingCandidates.current[socketId].push(candidate);
+        return;
+      }
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        // Ignore benign candidate errors
       }
     };
 
@@ -354,9 +336,10 @@ const Room = ({ session, onLeave }) => {
     socket.on('system-message', onSystemMessage);
     socket.on('room-closed', onRoomClosed);
     socket.on('viewer-joined', onViewerJoined);
-    socket.on('screen-share-started', onScreenShareStarted);
-    socket.on('screen-chunk', onScreenChunk);
-    socket.on('screen-share-stopped', onScreenShareStopped);
+    socket.on('viewer-left', onViewerLeft);
+    socket.on('webrtc-offer', onWebrtcOffer);
+    socket.on('webrtc-answer', onWebrtcAnswer);
+    socket.on('webrtc-ice-candidate', onWebrtcIceCandidate);
     socket.on('chat-message', onChatMessage);
 
     return () => {
@@ -366,18 +349,20 @@ const Room = ({ session, onLeave }) => {
       socket.off('system-message', onSystemMessage);
       socket.off('room-closed', onRoomClosed);
       socket.off('viewer-joined', onViewerJoined);
-      socket.off('screen-share-started', onScreenShareStarted);
-      socket.off('screen-chunk', onScreenChunk);
-      socket.off('screen-share-stopped', onScreenShareStopped);
+      socket.off('viewer-left', onViewerLeft);
+      socket.off('webrtc-offer', onWebrtcOffer);
+      socket.off('webrtc-answer', onWebrtcAnswer);
+      socket.off('webrtc-ice-candidate', onWebrtcIceCandidate);
       socket.off('chat-message', onChatMessage);
       stopScreenShare();
+      Object.values(peerConnections.current).forEach(pc => pc.close());
       socket.disconnect();
     };
   }, [session]);
 
-  // ====================================================
+  // ======================================================
   // ROOM ACTIONS
-  // ====================================================
+  // ======================================================
   const handleApprove = (userId) => {
     socket.emit('respond-join', { roomId, targetUserId: userId, approved: true });
     setJoinRequests(prev => prev.filter(r => r.userId !== userId));
@@ -410,9 +395,9 @@ const Room = ({ session, onLeave }) => {
     setPlayBlocked(false);
   };
 
-  // ====================================================
+  // ======================================================
   // RENDER
-  // ====================================================
+  // ======================================================
   if (status !== 'In Room') {
     return (
       <div className="screen-wrapper">
@@ -441,61 +426,44 @@ const Room = ({ session, onLeave }) => {
                 {session.nickname} · {session.isHost ? 'Host' : 'Viewer'}
               </p>
             </div>
+
             {session.isHost ? (
               <div className="room-header-controls">
                 {!isSharing ? (
                   isMobile ? (
-                    // Mobile: show dropdown menu to pick screen or camera
                     <div style={{ position: 'relative' }}>
-                      <button
-                        className="btn btn-primary"
-                        onClick={() => setShowMobileMenu(prev => !prev)}
-                        style={{ width: 'auto' }}
-                      >
-                        📡 Start Sharing ▾
+                      <button className="btn btn-primary" onClick={() => setShowMobileMenu(p => !p)} style={{ width: 'auto' }}>
+                        Start Sharing ▾
                       </button>
                       {showMobileMenu && (
                         <div style={{
-                          position: 'absolute',
-                          top: '110%',
-                          left: 0,
-                          background: 'var(--surface-color)',
-                          border: '1px solid var(--border-color)',
-                          borderRadius: 'var(--radius-md)',
-                          zIndex: 100,
-                          minWidth: '180px',
-                          boxShadow: '0 8px 24px rgba(0,0,0,0.4)',
-                          overflow: 'hidden',
+                          position: 'absolute', top: '110%', left: 0,
+                          background: 'var(--surface-color)', border: '1px solid var(--border-color)',
+                          borderRadius: 'var(--radius-md)', zIndex: 100, minWidth: '180px',
+                          boxShadow: '0 8px 24px rgba(0,0,0,0.4)', overflow: 'hidden',
                         }}>
                           {canDisplayMedia && (
-                            <button
-                              className="btn"
-                              onClick={startScreenShare}
-                              style={{ width: '100%', padding: '0.75rem 1rem', textAlign: 'left', borderRadius: 0, background: 'transparent', border: 'none', cursor: 'pointer' }}
-                            >
-                              🖥️ Share Screen
+                            <button className="btn" onClick={startScreenShare}
+                              style={{ width: '100%', padding: '0.75rem 1rem', textAlign: 'left', borderRadius: 0, background: 'transparent', border: 'none', cursor: 'pointer' }}>
+                              Share Screen
                             </button>
                           )}
-                          <button
-                            className="btn"
-                            onClick={startCameraShare}
-                            style={{ width: '100%', padding: '0.75rem 1rem', textAlign: 'left', borderRadius: 0, background: 'transparent', border: 'none', cursor: 'pointer', borderTop: canDisplayMedia ? '1px solid var(--border-color)' : 'none' }}
-                          >
-                            📷 Share Camera
+                          <button className="btn" onClick={startCameraShare}
+                            style={{ width: '100%', padding: '0.75rem 1rem', textAlign: 'left', borderRadius: 0, background: 'transparent', border: 'none', cursor: 'pointer', borderTop: canDisplayMedia ? '1px solid var(--border-color)' : 'none' }}>
+                            Share Camera
                           </button>
                         </div>
                       )}
                     </div>
                   ) : (
-                    // Desktop: direct screen share
                     <button className="btn btn-primary" onClick={startScreenShare} style={{ width: 'auto' }}>
-                      🖥️ Start Sharing Screen
+                      Start Sharing Screen
                     </button>
                   )
                 ) : (
                   <button className="btn btn-primary" onClick={stopScreenShare}
                     style={{ width: 'auto', backgroundColor: 'var(--danger-color)' }}>
-                    ⏹ Stop {shareMode === 'camera' ? 'Camera' : 'Screen'}
+                    Stop {shareMode === 'camera' ? 'Camera' : 'Screen'}
                   </button>
                 )}
                 <button className="btn btn-secondary" onClick={handleCopyLink} style={{ width: 'auto' }}>
@@ -510,12 +478,8 @@ const Room = ({ session, onLeave }) => {
           </div>
 
           <div className="card video-container">
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              style={{ width: '100%', height: '100%', objectFit: 'contain', backgroundColor: '#000' }}
-            />
+            <video ref={videoRef} autoPlay playsInline
+              style={{ width: '100%', height: '100%', objectFit: 'contain', backgroundColor: '#000' }} />
             {playBlocked && (
               <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.8)', zIndex: 10 }}>
                 <button className="btn btn-primary" onClick={handleForcePlay} style={{ width: 'auto', padding: '1rem 2rem', fontSize: '1.1rem' }}>
@@ -531,8 +495,6 @@ const Room = ({ session, onLeave }) => {
 
         {/* Sidebar */}
         <div className="room-sidebar">
-
-          {/* Pending Requests */}
           {session.isHost && joinRequests.length > 0 && (
             <div className="card fade-in" style={{ padding: '1.5rem' }}>
               <h4 style={{ marginBottom: '1rem', color: 'var(--accent-color)' }}>Pending Requests</h4>
@@ -550,12 +512,10 @@ const Room = ({ session, onLeave }) => {
             </div>
           )}
 
-          {/* Chat */}
           <div className="card" style={{ padding: '0', flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <div style={{ padding: '1.5rem', borderBottom: '1px solid var(--border-color)' }}>
               <h4 style={{ margin: 0 }}>Live Chat</h4>
             </div>
-
             <div style={{ flex: 1, overflowY: 'auto', padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
               {chatMessages.length === 0 && systemMessages.length === 0 && (
                 <div style={{ color: 'var(--text-secondary)', textAlign: 'center', margin: 'auto' }}>Say hi to the room!</div>
@@ -573,25 +533,18 @@ const Room = ({ session, onLeave }) => {
                       padding: '0.75rem 1rem',
                       borderRadius: isMe ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
                       maxWidth: '85%', wordBreak: 'break-word'
-                    }}>
-                      {msg.message}
-                    </div>
+                    }}>{msg.message}</div>
                   </div>
                 );
               })}
               <div ref={chatEndRef} />
             </div>
-
             <form onSubmit={handleSendMessage} style={{ padding: '1rem', borderTop: '1px solid var(--border-color)', display: 'flex', gap: '0.5rem' }}>
-              <input
-                type="text"
-                className="input-field"
-                placeholder="Type a message..."
-                value={chatInput}
-                onChange={e => setChatInput(e.target.value)}
-                style={{ padding: '0.75rem', marginBottom: 0 }}
-              />
-              <button type="submit" className="btn btn-primary" style={{ width: 'auto', padding: '0.75rem 1.25rem' }} disabled={!chatInput.trim()}>
+              <input type="text" className="input-field" placeholder="Type a message..."
+                value={chatInput} onChange={e => setChatInput(e.target.value)}
+                style={{ padding: '0.75rem', marginBottom: 0 }} />
+              <button type="submit" className="btn btn-primary"
+                style={{ width: 'auto', padding: '0.75rem 1.25rem' }} disabled={!chatInput.trim()}>
                 Send
               </button>
             </form>

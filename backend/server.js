@@ -9,19 +9,50 @@ app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
-  maxHttpBufferSize: 5e6, // 5MB max per message for screen chunks
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
+// =============================================
+// ICE SERVERS CONFIG ENDPOINT
+// Frontend calls this to get TURN credentials
+// =============================================
+app.get('/api/ice-servers', (req, res) => {
+  const iceServers = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ];
+
+  // Production TURN from environment variables (set these in Railway dashboard)
+  if (process.env.TURN_URL) {
+    iceServers.push({
+      urls: process.env.TURN_URL,
+      username: process.env.TURN_USERNAME || '',
+      credential: process.env.TURN_CREDENTIAL || '',
+    });
+    // Add TCP fallback if configured
+    if (process.env.TURN_URL_TCP) {
+      iceServers.push({
+        urls: process.env.TURN_URL_TCP,
+        username: process.env.TURN_USERNAME || '',
+        credential: process.env.TURN_CREDENTIAL || '',
+      });
+    }
+  }
+
+  res.json({ iceServers });
+});
+
+// =============================================
+// ROOM & SESSION STATE
+// =============================================
 const rooms = {};
 const disconnectTimeouts = {};
 
 io.on('connection', (socket) => {
   console.log(`User connected: ${socket.id}`);
 
-  // HOST CREATES OR REJOINS
+  // ---- HOST ----
   socket.on('create-room', ({ nickname, userId, existingRoomId }, callback) => {
     let roomId = existingRoomId;
 
@@ -32,8 +63,10 @@ io.on('connection', (socket) => {
       }
       rooms[roomId].hostId = socket.id;
       socket.join(roomId);
+      console.log(`Host ${nickname} reconnected to room [${roomId}]`);
       io.to(roomId).emit('system-message', `Host ${nickname} has reconnected.`);
 
+      // Re-trigger viewer-joined for each approved viewer so host can re-negotiate WebRTC
       Object.values(rooms[roomId].viewers).forEach(v => {
         if (v.status === 'approved') {
           socket.emit('viewer-joined', { socketId: v.socketId, nickname: v.nickname });
@@ -43,13 +76,13 @@ io.on('connection', (socket) => {
     }
 
     roomId = crypto.randomBytes(3).toString('hex');
-    rooms[roomId] = { hostId: socket.id, hostUserId: userId, viewers: {}, isSharing: false };
+    rooms[roomId] = { hostId: socket.id, hostUserId: userId, viewers: {} };
     socket.join(roomId);
     console.log(`Room [${roomId}] created by ${nickname}`);
     callback({ success: true, roomId, hostId: socket.id });
   });
 
-  // GUEST REQUESTS TO JOIN
+  // ---- GUEST ----
   socket.on('request-join', ({ roomId, nickname, userId }, callback) => {
     const room = rooms[roomId];
     if (!room) return callback({ error: "Room not found." });
@@ -64,7 +97,6 @@ io.on('connection', (socket) => {
       room.viewers[userId].socketId = socket.id;
       socket.join(roomId);
       io.to(roomId).emit('system-message', `${nickname} has reconnected.`);
-      // Tell host a viewer reconnected (host will restart recording if sharing)
       io.to(room.hostId).emit('viewer-joined', { socketId: socket.id, nickname });
       return callback({ success: true, status: 'approved', hostId: room.hostId });
     }
@@ -74,7 +106,6 @@ io.on('connection', (socket) => {
     callback({ success: true });
   });
 
-  // HOST APPROVES/REJECTS
   socket.on('respond-join', ({ roomId, targetUserId, approved }) => {
     const room = rooms[roomId];
     if (!room || room.hostId !== socket.id) return;
@@ -94,7 +125,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // EXPLICIT LEAVE
   socket.on('leave-room', ({ roomId, userId }) => {
     const room = rooms[roomId];
     if (!room) return;
@@ -109,30 +139,25 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ===================================================
-  // SCREEN SHARING RELAY (MediaRecorder approach)
-  // ===================================================
-  socket.on('screen-share-started', ({ roomId, mimeType }) => {
-    if (rooms[roomId]) rooms[roomId].isSharing = true;
-    socket.to(roomId).emit('screen-share-started', { mimeType });
+  // ---- WEBRTC SIGNALING ----
+  socket.on('webrtc-offer', ({ targetSocketId, offer }) => {
+    io.to(targetSocketId).emit('webrtc-offer', { socketId: socket.id, offer });
   });
 
-  // Binary screen data relay — socketio handles ArrayBuffer natively
-  socket.on('screen-chunk', ({ roomId, chunk }) => {
-    socket.to(roomId).emit('screen-chunk', chunk);
+  socket.on('webrtc-answer', ({ targetSocketId, answer }) => {
+    io.to(targetSocketId).emit('webrtc-answer', { socketId: socket.id, answer });
   });
 
-  socket.on('screen-share-stopped', ({ roomId }) => {
-    if (rooms[roomId]) rooms[roomId].isSharing = false;
-    socket.to(roomId).emit('screen-share-stopped');
+  socket.on('webrtc-ice-candidate', ({ targetSocketId, candidate }) => {
+    io.to(targetSocketId).emit('webrtc-ice-candidate', { socketId: socket.id, candidate });
   });
 
-  // CHAT
+  // ---- CHAT ----
   socket.on('chat-message', ({ roomId, nickname, message }) => {
     io.to(roomId).emit('chat-message', { nickname, message, timestamp: Date.now() });
   });
 
-  // DISCONNECT
+  // ---- DISCONNECT ----
   socket.on('disconnect', () => {
     console.log(`User disconnected: ${socket.id}`);
     for (const [roomId, room] of Object.entries(rooms)) {
