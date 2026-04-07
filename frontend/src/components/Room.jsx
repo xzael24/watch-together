@@ -5,6 +5,22 @@ const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    // Free TURN relay servers - fallback when direct P2P connection fails
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ]
 };
 
@@ -15,19 +31,16 @@ const Room = ({ session, onLeave }) => {
   const [joinRequests, setJoinRequests] = useState([]);
   const [systemMessages, setSystemMessages] = useState([]);
   
-  // Phase 5: Chat State
   const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const chatEndRef = useRef(null);
   
-  // WebRTC & Media State
   const [isSharing, setIsSharing] = useState(false);
   const [hasStream, setHasStream] = useState(false);
   const [playBlocked, setPlayBlocked] = useState(false);
   const videoRef = useRef(null);
   const localStream = useRef(null);
-  const peerConnections = useRef({}); 
-  const webrtcLocks = useRef({});
+  const peerConnections = useRef({});
   const pendingCandidates = useRef({});
 
   // Auto-scroll chat
@@ -78,26 +91,35 @@ const Room = ({ session, onLeave }) => {
       if (prev.some(req => req.userId === data.userId)) return prev;
       return [...prev, data];
     });
+
     const onJoinApproved = (data) => {
       setRoomId(data.roomId);
       setHostId(data.hostId);
       setStatus('In Room');
     };
+
     const onJoinRejected = (data) => {
       setStatus('Rejected: ' + data.message);
       socket.disconnect();
     };
+
     const onSystemMessage = (message) => setSystemMessages(prev => [...prev, message]);
+
     const onRoomClosed = (data) => {
       setStatus('Room Closed: ' + data.message);
       stopScreenShare();
       socket.disconnect();
     };
 
+    // HOST side: a viewer has joined, create a peer connection and send offer
     const onViewerJoined = async ({ socketId, nickname }) => {
-      createPeerConnection(socketId);
+      console.log('[HOST] Viewer joined:', socketId, nickname);
+      const pc = createPeerConnection(socketId);
       if (localStream.current) {
+        console.log('[HOST] Stream active, negotiating with viewer...');
         await negotiateConnection(socketId);
+      } else {
+        console.log('[HOST] No stream yet. Will negotiate when sharing starts.');
       }
     };
 
@@ -108,18 +130,24 @@ const Room = ({ session, onLeave }) => {
       }
     };
 
+    // VIEWER side: receives the offer from Host
     const onWebrtcOffer = async ({ socketId, offer }) => {
-      if (webrtcLocks.current[socketId]) return;
-      webrtcLocks.current[socketId] = true;
+      console.log('[VIEWER] Received offer from host:', socketId);
       try {
-        const pc = createPeerConnection(socketId);
-        if (pc.signalingState !== "stable") {
-          webrtcLocks.current[socketId] = false;
-          return;
+        // Always create fresh PC for each new offer to avoid stale state
+        if (peerConnections.current[socketId]) {
+          peerConnections.current[socketId].close();
+          delete peerConnections.current[socketId];
+          delete pendingCandidates.current[socketId];
         }
+
+        const pc = createPeerConnection(socketId);
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
-        
-        if (pendingCandidates.current[socketId]) {
+        console.log('[VIEWER] Remote description set. Creating answer...');
+
+        // Drain any ICE candidates that arrived before the offer was processed
+        if (pendingCandidates.current[socketId]?.length) {
+          console.log('[VIEWER] Draining', pendingCandidates.current[socketId].length, 'buffered ICE candidates');
           for (const c of pendingCandidates.current[socketId]) {
             try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
           }
@@ -129,36 +157,44 @@ const Room = ({ session, onLeave }) => {
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit('webrtc-answer', { targetSocketId: socketId, answer });
+        console.log('[VIEWER] Answer sent to host.');
       } catch (e) {
-        if (!e.message.includes('wrong state')) {
-          console.error("Error handling WebRTC offer:", e);
-        }
-      } finally {
-        webrtcLocks.current[socketId] = false;
+        console.error('[VIEWER] Error handling offer:', e);
       }
     };
 
+    // HOST side: receives answer from viewer
     const onWebrtcAnswer = async ({ socketId, answer }) => {
+      console.log('[HOST] Received answer from viewer:', socketId);
       try {
         const pc = peerConnections.current[socketId];
-        if (pc && pc.signalingState !== "stable") {
+        if (!pc) {
+          console.warn('[HOST] No peer connection found for:', socketId);
+          return;
+        }
+        if (pc.signalingState === 'have-local-offer') {
           await pc.setRemoteDescription(new RTCSessionDescription(answer));
-          
-          if (pendingCandidates.current[socketId]) {
+          console.log('[HOST] Remote description (answer) set successfully.');
+
+          // Drain buffered ICE candidates
+          if (pendingCandidates.current[socketId]?.length) {
             for (const c of pendingCandidates.current[socketId]) {
               try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
             }
             pendingCandidates.current[socketId] = [];
           }
+        } else {
+          console.warn('[HOST] Unexpected signalingState when receiving answer:', pc.signalingState);
         }
       } catch (e) {
-        console.error("Error handling WebRTC answer:", e);
+        console.error('[HOST] Error handling answer:', e);
       }
     };
 
     const onWebrtcIceCandidate = async ({ socketId, candidate }) => {
       const pc = peerConnections.current[socketId];
       if (!pc || !pc.remoteDescription) {
+        // Buffer it until remote description is set
         if (!pendingCandidates.current[socketId]) pendingCandidates.current[socketId] = [];
         pendingCandidates.current[socketId].push(candidate);
         return;
@@ -166,11 +202,10 @@ const Room = ({ session, onLeave }) => {
       try {
         await pc.addIceCandidate(new RTCIceCandidate(candidate));
       } catch (e) {
-        console.error("Error adding ice candidate:", e);
+        console.error('Error adding ICE candidate:', e);
       }
     };
 
-    // Phase 5: Chat Listener
     const onChatMessage = (data) => {
       setChatMessages(prev => [...prev, data]);
     };
@@ -206,8 +241,6 @@ const Room = ({ session, onLeave }) => {
   }, [session]);
 
   const createPeerConnection = (targetSocketId) => {
-    if (peerConnections.current[targetSocketId]) return peerConnections.current[targetSocketId];
-
     const pc = new RTCPeerConnection(ICE_SERVERS);
     peerConnections.current[targetSocketId] = pc;
 
@@ -217,20 +250,26 @@ const Room = ({ session, onLeave }) => {
       }
     };
 
+    pc.onconnectionstatechange = () => {
+      console.log(`[PC ${targetSocketId}] Connection state: ${pc.connectionState}`);
+    };
+
+    pc.onsignalingstatechange = () => {
+      console.log(`[PC ${targetSocketId}] Signaling state: ${pc.signalingState}`);
+    };
+
+    // VIEWER receives the media tracks here
     pc.ontrack = (event) => {
+      console.log('[VIEWER] ontrack fired! Got stream:', event.streams[0]);
       if (videoRef.current && event.streams[0]) {
         videoRef.current.srcObject = event.streams[0];
         setHasStream(true);
         
-        // Use the proper promise-based autoplay pattern
         const playPromise = videoRef.current.play();
         if (playPromise !== undefined) {
           playPromise.then(() => {
-            // Autoplay succeeded, make sure blocked state is cleared
             setPlayBlocked(false);
           }).catch(e => {
-            // Only show the "click to play" overlay for real autoplay policy blocks,
-            // not for the harmless "media removed" abort that React triggers on re-render
             if (e.name === 'NotAllowedError') {
               setPlayBlocked(true);
             }
@@ -239,13 +278,12 @@ const Room = ({ session, onLeave }) => {
 
         const track = event.streams[0].getVideoTracks()[0];
         if (track) {
-          track.onended = () => {
-            setHasStream(false);
-          };
+          track.onended = () => { setHasStream(false); };
         }
       }
     };
 
+    // HOST: attach existing stream tracks to the new PC
     if (session.isHost && localStream.current) {
       localStream.current.getTracks().forEach(track => {
         pc.addTrack(track, localStream.current);
@@ -259,6 +297,7 @@ const Room = ({ session, onLeave }) => {
     const pc = peerConnections.current[targetSocketId];
     if (!pc) return;
 
+    console.log('[HOST] Creating offer for:', targetSocketId);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
     socket.emit('webrtc-offer', { targetSocketId, offer });
@@ -278,7 +317,9 @@ const Room = ({ session, onLeave }) => {
         stopScreenShare();
       };
 
+      // Send stream to all connected viewers
       for (const [targetSocketId, pc] of Object.entries(peerConnections.current)) {
+        console.log('[HOST] Adding tracks + renegotiating with:', targetSocketId);
         stream.getTracks().forEach(track => {
           pc.addTrack(track, stream);
         });
@@ -286,7 +327,7 @@ const Room = ({ session, onLeave }) => {
       }
       
     } catch (err) {
-      console.error("Error sharing screen: ", err);
+      console.error("Error sharing screen:", err);
     }
   };
 
@@ -316,7 +357,6 @@ const Room = ({ session, onLeave }) => {
     alert('Room ID copied: ' + roomId);
   };
 
-  // Phase 5: Sending Chat
   const handleSendMessage = (e) => {
     e.preventDefault();
     if (!chatInput.trim()) return;
@@ -430,7 +470,6 @@ const Room = ({ session, onLeave }) => {
             </div>
             
             <div style={{ flex: 1, overflowY: 'auto', padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-              {/* Render System Messages alongside regular messages if needed, here we focus on Chat */}
               {chatMessages.length === 0 && systemMessages.length === 0 && (
                 <div style={{ color: 'var(--text-secondary)', textAlign: 'center', margin: 'auto' }}>Say hi to the room!</div>
               )}
