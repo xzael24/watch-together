@@ -62,13 +62,22 @@ app.get('/api/ice-servers', (req, res) => {
       username: TURN_USER,
       credential: TURN_PASS,
     });
-  } else if (process.env.TURN_URL) {
-    // Production: use TURN credentials from env vars
+  }
+
+  if (process.env.TURN_URL) {
+    // Production: use TURN credentials from env vars (preferred)
     iceServers.push({
       urls: process.env.TURN_URL,
       username: process.env.TURN_USERNAME || '',
       credential: process.env.TURN_CREDENTIAL || '',
     });
+  } else if (process.env.NODE_ENV === 'production') {
+    // Production fallback: use open relay TURN servers
+    iceServers.push(
+      { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+      { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+    );
   }
 
   res.json({ iceServers });
