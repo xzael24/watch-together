@@ -28,6 +28,7 @@ const Room = ({ session, onLeave }) => {
   const localStream = useRef(null);
   const peerConnections = useRef({}); 
   const webrtcLocks = useRef({});
+  const pendingCandidates = useRef({});
 
   // Auto-scroll chat
   useEffect(() => {
@@ -117,6 +118,14 @@ const Room = ({ session, onLeave }) => {
           return;
         }
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
+        
+        if (pendingCandidates.current[socketId]) {
+          for (const c of pendingCandidates.current[socketId]) {
+            try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
+          }
+          pendingCandidates.current[socketId] = [];
+        }
+
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         socket.emit('webrtc-answer', { targetSocketId: socketId, answer });
@@ -134,6 +143,13 @@ const Room = ({ session, onLeave }) => {
         const pc = peerConnections.current[socketId];
         if (pc && pc.signalingState !== "stable") {
           await pc.setRemoteDescription(new RTCSessionDescription(answer));
+          
+          if (pendingCandidates.current[socketId]) {
+            for (const c of pendingCandidates.current[socketId]) {
+              try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
+            }
+            pendingCandidates.current[socketId] = [];
+          }
         }
       } catch (e) {
         console.error("Error handling WebRTC answer:", e);
@@ -142,12 +158,15 @@ const Room = ({ session, onLeave }) => {
 
     const onWebrtcIceCandidate = async ({ socketId, candidate }) => {
       const pc = peerConnections.current[socketId];
-      if (pc) {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(candidate));
-        } catch (e) {
-          console.error("Error adding ice candidate:", e);
-        }
+      if (!pc || !pc.remoteDescription) {
+        if (!pendingCandidates.current[socketId]) pendingCandidates.current[socketId] = [];
+        pendingCandidates.current[socketId].push(candidate);
+        return;
+      }
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.error("Error adding ice candidate:", e);
       }
     };
 
@@ -203,15 +222,20 @@ const Room = ({ session, onLeave }) => {
         videoRef.current.srcObject = event.streams[0];
         setHasStream(true);
         
-        // Attempt to autoplay, browser might block it if user refreshed without interacting
-        setTimeout(() => {
-          if (videoRef.current) {
-            videoRef.current.play().catch(e => {
-              console.error("Autoplay blocked by browser:", e);
+        // Use the proper promise-based autoplay pattern
+        const playPromise = videoRef.current.play();
+        if (playPromise !== undefined) {
+          playPromise.then(() => {
+            // Autoplay succeeded, make sure blocked state is cleared
+            setPlayBlocked(false);
+          }).catch(e => {
+            // Only show the "click to play" overlay for real autoplay policy blocks,
+            // not for the harmless "media removed" abort that React triggers on re-render
+            if (e.name === 'NotAllowedError') {
               setPlayBlocked(true);
-            });
-          }
-        }, 100);
+            }
+          });
+        }
 
         const track = event.streams[0].getVideoTracks()[0];
         if (track) {
